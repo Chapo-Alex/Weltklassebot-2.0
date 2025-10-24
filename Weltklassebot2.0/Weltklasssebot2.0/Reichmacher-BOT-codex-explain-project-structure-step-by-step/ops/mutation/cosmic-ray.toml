@@ -1,0 +1,19 @@
+[cosmic-ray]
+timeout = 30
+modules = [
+  "src/core",
+  "src/portfolio",
+  "src/risk",
+  "src/strategy"
+]
+
+[execution]
+operator-plugins = ["cosmic_ray.operators.all"]
+
+[report]
+show-mutants = true
+show-skipped = true
+
+[pytest]
+# schlanke, reproduzierbare Testausführung ohne slow/perf
+args = ["-q", "-m", "not slow"]

@@ -1,0 +1,20 @@
+[cosmic-ray]
+module-path = "src"
+python-version = "3.11"
+modules = [
+  "core.events",
+  "core.engine",
+  "portfolio.accounting",
+  "portfolio.risk",
+]
+timeout = 60.0
+test-command = ["python", "-m", "pytest", "-q", "tests/core", "tests/portfolio"]
+
+[cosmic-ray.cloning]
+method = "copy"
+
+[cosmic-ray.execution]
+executor = "local"
+
+[cosmic-ray.execution.env-vars]
+PYTHONPATH = "src"

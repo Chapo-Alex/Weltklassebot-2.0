@@ -1,0 +1,29 @@
+groups:
+  - name: weltklassebot
+    rules:
+      - alert: RiskStateHalted
+        expr: max_over_time(risk_state{state="HALTED"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine halted"
+          description: "Risk state stayed HALTED for >1m"
+
+      - alert: RiskDenialsSpike
+        expr: increase(risk_denials_total[5m]) > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Risk denials spike"
+          description: "Sum over 5m exceeds expected envelope"
+
+      - alert: StageLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(engine_stage_latency_bucket[5m]))) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 stage latency >50ms"
+          description: "Pipeline stage latency p95 exceeds 50ms over 5m"

@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: weltklasse-alerts
+  labels:
+    prometheus: weltklasse
+    role: alert-rules
+spec:
+  groups:
+    - name: weltklasse.trading
+      rules:
+        - alert: HighStageLatency
+          expr: |
+            histogram_quantile(0.95, sum(rate(stage_latency_seconds_bucket[5m])) by (le, stage)) > 0.25
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "Stage latency above SLO"
+            description: |
+              Execution stage {{ $labels.stage }} p95 latency exceeded 250ms.
+        - alert: RiskCooldownTooLong
+          expr: |
+            max_over_time(risk_state[30m]) == 1
+          for: 30m
+          labels:
+            severity: warn
+          annotations:
+            summary: "Risk manager stuck in cooldown"
+            description: |
+              Risk state has remained in COOLDOWN for 30 minutes.
+        - alert: DrawdownNearLimit
+          expr: |
+            drawdown_pct > 0.9 * cfg_max_dd
+          for: 10m
+          labels:
+            severity: warn
+          annotations:
+            summary: "Drawdown approaching configured max"
+            description: |
+              Observed drawdown is within 10%% of the configured max drawdown limit.
