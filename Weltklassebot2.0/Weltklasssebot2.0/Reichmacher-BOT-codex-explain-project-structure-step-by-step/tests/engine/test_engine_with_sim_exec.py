@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -45,6 +45,9 @@ class _TestSlippage(SlippageModel):
     def maker_fill_prob(self, queue_eta: float) -> float:
         del queue_eta
         return self._maker_prob
+
+    def bind_rng(self, rng: Any) -> None:
+        del rng
 
 
 class _ScriptedStrategy:

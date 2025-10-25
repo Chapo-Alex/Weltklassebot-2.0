@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import sys
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -160,8 +161,39 @@ def _set_global_seed(seed: int = 1337) -> None:
         _np.random.seed(seed)
 
 
+def _configure_benchmark(config: pytest.Config) -> None:
+    try:
+        import pytest_benchmark.plugin  # noqa: F401
+    except ImportError:
+        return
+
+    _set_global_seed()
+
+    option = getattr(config, "option", None)
+    if option is None:
+        return
+
+    min_rounds = getattr(option, "benchmark_min_rounds", None)
+    try:
+        rounds_value = int(min_rounds) if min_rounds is not None else 0
+    except (TypeError, ValueError):
+        rounds_value = 0
+    if rounds_value < 5:
+        option.benchmark_min_rounds = 5  # type: ignore[attr-defined]
+
+    if hasattr(option, "benchmark_disable_gc"):
+        option.benchmark_disable_gc = False
+    if hasattr(option, "benchmark_timer"):
+        option.benchmark_timer = "time.perf_counter"
+    if hasattr(option, "benchmark_random_order"):
+        option.benchmark_random_order = False
+    if hasattr(option, "benchmark_random_base"):
+        option.benchmark_random_base = 1337
+
+
 def pytest_configure(config: pytest.Config) -> None:
     _set_global_seed()
+    _configure_benchmark(config)
     targets, threshold = _load_targets(config)
     tracer = _CoverageTracer(targets, threshold)
     tracer.start()

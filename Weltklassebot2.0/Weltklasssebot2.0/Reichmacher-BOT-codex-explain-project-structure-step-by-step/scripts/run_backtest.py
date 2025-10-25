@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
-        default=1337,
+        default=42,
         help="Random seed controlling jitter",
     )
     parser.add_argument(
@@ -129,6 +131,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Risk session identifier forwarded to the state machine",
     )
     parser.add_argument(
+        "--risk-store-dir",
+        type=Path,
+        help="Directory for persisting risk state snapshots and audit logs",
+    )
+    parser.add_argument(
+        "--risk-store-rotate-lines",
+        type=int,
+        default=100_000,
+        help="Rotate risk audit JSONL after this many lines (set <=0 to disable)",
+    )
+    parser.add_argument(
+        "--risk-store-rotate-mb",
+        type=int,
+        default=64,
+        help="Rotate risk audit JSONL after this many megabytes (set <=0 to disable)",
+    )
+    parser.add_argument(
+        "--risk-store-fsync",
+        action="store_true",
+        help="Force fsync after each audit append for durability",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path.cwd(),
@@ -155,9 +179,21 @@ def _default_strategy_config() -> StrategyConfig:
 
 
 def main() -> None:
+    if os.environ.get("WELTKLASSE_SUPPRESS_SCRIPT_WARNING") != "1":
+        print(
+            "[DEPRECATED] Use `python -m cli backtest` instead of scripts/run_backtest.py",
+            file=sys.stderr,
+        )
     parser = _build_parser()
     args = parser.parse_args()
     maker_fee, taker_fee = _parse_fees(args.fees)
+
+    rotate_lines = args.risk_store_rotate_lines
+    if rotate_lines is not None and rotate_lines <= 0:
+        rotate_lines = None
+    rotate_mb = args.risk_store_rotate_mb
+    if rotate_mb is not None and rotate_mb <= 0:
+        rotate_mb = None
 
     config = BacktestConfig(
         data_path=args.data,
@@ -172,6 +208,10 @@ def main() -> None:
         initial_cash=args.initial_cash,
         session_name=args.session,
         strategy_config=_default_strategy_config(),
+        risk_store_dir=args.risk_store_dir,
+        risk_store_rotate_lines=rotate_lines,
+        risk_store_rotate_mb=rotate_mb,
+        risk_store_fsync=args.risk_store_fsync,
     )
 
     engine = BacktestEngine(config)

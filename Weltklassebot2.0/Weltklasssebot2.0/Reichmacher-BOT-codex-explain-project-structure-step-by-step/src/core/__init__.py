@@ -1,5 +1,6 @@
 """Core package exports for convenience imports."""
 
-from .engine import BacktestConfig, BacktestEngine, ExecutionClient
+from .config import BacktestConfig
+from .engine import BacktestEngine, ExecutionClient
 
 __all__ = ["BacktestConfig", "BacktestEngine", "ExecutionClient"]

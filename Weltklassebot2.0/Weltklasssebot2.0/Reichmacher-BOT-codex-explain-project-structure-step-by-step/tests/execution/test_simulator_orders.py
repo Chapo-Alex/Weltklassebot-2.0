@@ -9,8 +9,8 @@ import pytest
 
 from core.events import LiquidityFlag, OrderEvent, OrderSide, OrderType
 from execution.orderbook import OrderBook
-from execution.simulator import ExecConfig, OmsSimulator, Rejection
-from execution.slippage import ImpactLinear, QueuePosition, SlippageModel
+from execution.oms_simulator import ExecConfig, OmsSimulator, Rejection
+from execution.slippage import LinearSlippage, SlippageModel
 
 BASE_TS = datetime(2024, 1, 1, tzinfo=UTC)
 SYMBOL = "BTCUSDT"
@@ -43,15 +43,17 @@ def _make_order(
     )
 
 
+DEFAULT_SEED = 1337
+
+
 def _default_config(slippage: SlippageModel | None = None) -> ExecConfig:
-    model = slippage or ImpactLinear(k=0.0)
+    model = slippage or LinearSlippage(bps_per_notional=0.0)
     return ExecConfig(
         slippage=model,
         taker_fee=0.001,
         maker_fee=0.0005,
         latency_ms=0,
         jitter_ms=0,
-        seed=1337,
     )
 
 
@@ -65,7 +67,7 @@ def test_market_buy_matches_vwap_and_fee() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
     book.add("ask", 102.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order("mkt-buy", side=OrderSide.BUY, qty=1.5, order_type=OrderType.MARKET)
     fills = sim.send(order, BASE_TS)
     assert isinstance(fills, list)
@@ -83,7 +85,7 @@ def test_market_sell_matches_vwap_and_fee() -> None:
     book = OrderBook()
     book.add("bid", 99.0, 1.0)
     book.add("bid", 98.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order("mkt-sell", side=OrderSide.SELL, qty=1.5, order_type=OrderType.MARKET)
     fills = sim.send(order, BASE_TS)
     assert isinstance(fills, list)
@@ -97,7 +99,7 @@ def test_market_sell_matches_vwap_and_fee() -> None:
 def test_post_only_limit_rests_in_book() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "limit-maker",
         side=OrderSide.BUY,
@@ -116,7 +118,7 @@ def test_post_only_limit_rests_in_book() -> None:
 def test_post_only_crossing_order_rejected() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "post-cross",
         side=OrderSide.BUY,
@@ -134,7 +136,7 @@ def test_aggressive_limit_partial_fill_and_rest() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
     book.add("ask", 102.0, 0.5)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "limit-partial",
         side=OrderSide.BUY,
@@ -160,7 +162,7 @@ def test_ioc_limit_does_not_leave_residual() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
     book.add("ask", 102.0, 0.5)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "limit-ioc",
         side=OrderSide.BUY,
@@ -179,7 +181,7 @@ def test_ioc_limit_does_not_leave_residual() -> None:
 def test_fok_limit_rejects_when_not_filled() -> None:
     book = OrderBook()
     book.add("ask", 101.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "limit-fok",
         side=OrderSide.BUY,
@@ -197,7 +199,7 @@ def test_reduce_only_orders_enforce_position_limits() -> None:
     book = OrderBook()
     book.add("bid", 99.0, 2.0)
     book.add("ask", 101.0, 2.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     sim._positions[SYMBOL] = 1.0
     sell_order = _make_order(
         "reduce-sell",
@@ -224,7 +226,7 @@ def test_reduce_only_orders_enforce_position_limits() -> None:
 def test_stop_orders_trigger_on_touch() -> None:
     book = OrderBook()
     book.add("ask", 105.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     triggered = _make_order(
         "stop-buy",
         side=OrderSide.BUY,
@@ -250,7 +252,7 @@ def test_stop_orders_trigger_on_touch() -> None:
 def test_stop_limit_resting_behaviour() -> None:
     book = OrderBook()
     book.add("ask", 105.0, 1.0)
-    sim = OmsSimulator(book, _default_config())
+    sim = OmsSimulator(book, _default_config(), seed=DEFAULT_SEED)
     order = _make_order(
         "stop-limit",
         side=OrderSide.BUY,
@@ -267,8 +269,8 @@ def test_stop_limit_resting_behaviour() -> None:
 
 def test_maker_fill_occurs_on_tick(monkeypatch: pytest.MonkeyPatch) -> None:
     book = OrderBook()
-    cfg = _default_config(slippage=QueuePosition(eta=5.0))
-    sim = OmsSimulator(book, cfg)
+    cfg = _default_config(slippage=LinearSlippage(maker_queue_eta=5.0))
+    sim = OmsSimulator(book, cfg, seed=DEFAULT_SEED)
     order = _make_order(
         "maker-fill",
         side=OrderSide.BUY,

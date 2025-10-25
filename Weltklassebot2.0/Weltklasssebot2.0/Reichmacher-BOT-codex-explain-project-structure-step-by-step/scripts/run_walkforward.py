@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -175,7 +177,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
-        default=1337,
+        default=42,
         help="Seed used for random search",
     )
     parser.add_argument(
@@ -247,6 +249,11 @@ def _resolve_objective(name: str) -> Callable[[Sequence[float], float, float], f
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None and os.environ.get("WELTKLASSE_SUPPRESS_SCRIPT_WARNING") != "1":
+        print(
+            "[DEPRECATED] Use `python -m cli walkforward` instead of scripts/run_walkforward.py",
+            file=sys.stderr,
+        )
     parser = _build_parser()
     args = parser.parse_args(argv)
 

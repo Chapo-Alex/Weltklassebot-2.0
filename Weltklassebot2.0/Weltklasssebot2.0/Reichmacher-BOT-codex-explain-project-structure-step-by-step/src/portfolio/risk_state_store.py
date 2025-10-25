@@ -6,9 +6,12 @@ import json
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+
+from state import JsonlStore
 
 
 @dataclass(slots=True)
@@ -18,6 +21,19 @@ class JsonlStateStore:
     dir: Path
     state_name: str = "risk_state.json"
     audit_name: str = "risk_audit.jsonl"
+    rotate_lines: int | None = 100_000
+    rotate_mb: int | None = 64
+    fsync: bool = False
+    _audit_store: JsonlStore = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.dir = Path(self.dir)
+        self._audit_store = JsonlStore(
+            self.audit_path,
+            rotate_lines=self.rotate_lines,
+            rotate_mb=self.rotate_mb,
+            fsync=self.fsync,
+        )
 
     @property
     def state_path(self) -> Path:
@@ -49,16 +65,11 @@ class JsonlStateStore:
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.state_path)
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 os.remove(tmp_path)
-            except FileNotFoundError:
-                pass
 
     def append_audit(self, event: dict[str, Any]) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-        with self.audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+        self._audit_store.append(event)
 
     @staticmethod
     def now() -> float:

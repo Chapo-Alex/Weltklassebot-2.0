@@ -12,7 +12,7 @@ from core.events import FillEvent, OrderEvent
 class Connector(Protocol):
     """Abstraction for order routing backends."""
 
-    def send_order(self, order: OrderEvent, *, idempotency_key: str) -> str:
+    def send_order(self, order: OrderEvent, *, idempotency_key: str | None = None) -> str:
         """Submit an order and return its broker-assigned identifier."""
 
     def amend_order(self, order_id: str, **kwargs: object) -> None:

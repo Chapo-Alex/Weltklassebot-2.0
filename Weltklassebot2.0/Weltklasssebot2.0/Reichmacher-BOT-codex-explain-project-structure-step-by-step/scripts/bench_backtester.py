@@ -237,7 +237,7 @@ def run_benchmark(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candles", type=int, default=200_000, help="Number of candles to replay")
-    parser.add_argument("--seed", type=int, default=1337, help="Deterministic RNG seed")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed")
     parser.add_argument("--repeats", type=int, default=3, help="Number of timed benchmark runs")
     parser.add_argument("--symbol", default="BTCUSDT", help="Synthetic symbol to benchmark")
     return parser

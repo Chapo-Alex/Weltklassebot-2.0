@@ -9,8 +9,8 @@ import pytest
 from core.events import OrderEvent, OrderSide, OrderType
 from core.metrics import CollectorRegistry, set_registry
 from execution.orderbook import OrderBook
-from execution.simulator import ExecConfig, OmsSimulator, Rejection
-from execution.slippage import ImpactLinear
+from execution.oms_simulator import ExecConfig, OmsSimulator, Rejection
+from execution.slippage import LinearSlippage
 from portfolio.risk import RiskContext, RiskManagerV2, RiskParameters
 
 BASE_TS = datetime(2024, 1, 1, tzinfo=UTC)
@@ -40,14 +40,13 @@ def _assert_counter_increment(counter) -> None:  # type: ignore[no-untyped-def]
 def _simulator() -> OmsSimulator:
     book = OrderBook()
     cfg = ExecConfig(
-        slippage=ImpactLinear(k=0.0),
+        slippage=LinearSlippage(bps_per_notional=0.0),
         taker_fee=0.0004,
         maker_fee=0.0002,
         latency_ms=5,
         jitter_ms=0,
-        seed=1337,
     )
-    return OmsSimulator(book, cfg)
+    return OmsSimulator(book, cfg, seed=1337)
 
 
 def test_post_only_cross_denial_increments_counter() -> None:
@@ -172,6 +171,8 @@ def test_session_blackout_denial_triggers_cooldown_metric() -> None:
         trades_today=1,
         now=now,
         session="news_blackout",
+        orderbook_mid=100.0,
+        last_close=100.0,
     )
     order = OrderEvent(
         id="session-block",

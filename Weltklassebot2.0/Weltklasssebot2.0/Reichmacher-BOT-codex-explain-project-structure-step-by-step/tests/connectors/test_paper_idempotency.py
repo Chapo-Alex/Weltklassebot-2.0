@@ -9,8 +9,8 @@ import pytest
 from connectors.paper import PaperConnector
 from core.events import OrderEvent, OrderSide, OrderType
 from execution.orderbook import OrderBook
-from execution.simulator import ExecConfig, OmsSimulator
-from execution.slippage import ImpactLinear
+from execution.oms_simulator import ExecConfig, OmsSimulator
+from execution.slippage import LinearSlippage
 
 BASE_TS = datetime(2024, 1, 1, tzinfo=UTC)
 SYMBOL = "BTCUSDT"
@@ -35,14 +35,13 @@ def _build_simulator() -> OmsSimulator:
     book.add("ask", 101.0, 0.6)
     book.add("ask", 102.0, 0.6)
     cfg = ExecConfig(
-        slippage=ImpactLinear(k=0.0),
+        slippage=LinearSlippage(bps_per_notional=0.0),
         taker_fee=0.0,
         maker_fee=0.0,
         latency_ms=0,
         jitter_ms=0,
-        seed=1337,
     )
-    return OmsSimulator(book, cfg)
+    return OmsSimulator(book, cfg, seed=1337)
 
 
 def test_idempotent_submission_reuses_order_id() -> None:

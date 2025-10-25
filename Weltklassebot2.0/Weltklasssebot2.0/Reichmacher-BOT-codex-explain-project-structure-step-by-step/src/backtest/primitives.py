@@ -6,20 +6,13 @@ import io
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-from core.events import CandleEvent, FillEvent
-
-pd: Any | None = None
-try:  # pragma: no cover - optional dependency for richer IO
-    import pandas as _pd
-except ModuleNotFoundError:  # pragma: no cover - fallback path
-    _pd = None
-pd = cast(Any, _pd)
+from core.events import CandleEvent, FillEvent, OrderEvent
+from data.loader_parquet import ParquetDataLoader
 
 if TYPE_CHECKING:
-    from core.engine import BacktestConfig
+    from core.config import BacktestConfig
 
 
 @dataclass(slots=True)
@@ -42,6 +35,8 @@ class BacktestResult:
     candles_processed: int
     config: BacktestConfig
     tca: list[dict[str, float]] = field(default_factory=list)
+    orders: list[OrderEvent] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
 
     def trades_records(self) -> list[dict[str, Any]]:
         """Return executed trades encoded as serialisable dictionaries."""
@@ -73,6 +68,32 @@ class BacktestResult:
             }
             for point in self.equity_curve
         ]
+
+    def order_records(self) -> list[dict[str, Any]]:
+        """Return submitted orders encoded as serialisable dictionaries."""
+
+        return [
+            {
+                "order_id": order.id,
+                "timestamp": order.ts.astimezone(UTC).isoformat(),
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "qty": order.qty,
+                "type": order.type.value,
+                "price": order.price if order.price is not None else "",
+                "stop": order.stop if order.stop is not None else "",
+                "tif": order.tif,
+                "reduce_only": order.reduce_only,
+                "post_only": order.post_only,
+                "client_tag": order.client_tag or "",
+            }
+            for order in self.orders
+        ]
+
+    def event_records(self) -> list[dict[str, Any]]:
+        """Return replayable events in deterministic order."""
+
+        return list(self.events)
 
     def trades_csv(self) -> str:
         """Render trade records to CSV."""
@@ -108,106 +129,6 @@ class BacktestResult:
             "final_equity": final_equity,
             "max_drawdown": max_drawdown,
         }
-
-
-class ParquetDataLoader:  # pragma: no cover - IO heavy and exercised via integration tests
-    """Load candle events from a Parquet file or JSON fallback."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-
-    def load(self, symbol: str, start: datetime, end: datetime) -> list[CandleEvent]:
-        if pd is not None:
-            return self._load_with_pandas(symbol, start, end)
-        return self._load_from_json(symbol, start, end)
-
-    def _load_with_pandas(  # pragma: no cover - optional dependency path
-        self, symbol: str, start: datetime, end: datetime
-    ) -> list[CandleEvent]:
-        if pd is None:  # pragma: no cover - defensive fallback
-            raise RuntimeError("pandas is required for parquet loading")
-        assert pd is not None
-        frame = pd.read_parquet(self._path)
-        expected = {"symbol", "open", "high", "low", "close", "volume", "start", "end"}
-        missing = expected.difference(frame.columns)
-        if missing:
-            missing_fmt = ", ".join(sorted(missing))
-            msg = f"Parquet dataset missing required columns: {missing_fmt}"
-            raise ValueError(msg)
-
-        filtered = frame[frame["symbol"] == symbol].copy()
-        if filtered.empty:
-            return []
-
-        filtered["start"] = pd.to_datetime(filtered["start"], utc=True)
-        filtered["end"] = pd.to_datetime(filtered["end"], utc=True)
-        start_ts = pd.Timestamp(start)
-        end_ts = pd.Timestamp(end)
-
-        mask = (filtered["end"] >= start_ts) & (filtered["start"] <= end_ts)
-        scoped = filtered.loc[mask]
-        scoped = scoped.sort_values("start")
-
-        candles: list[CandleEvent] = []
-        for row in scoped.itertuples(index=False):
-            candles.append(
-                CandleEvent(
-                    symbol=row.symbol,
-                    open=float(row.open),
-                    high=float(row.high),
-                    low=float(row.low),
-                    close=float(row.close),
-                    volume=float(row.volume),
-                    start=row.start.to_pydatetime(),
-                    end=row.end.to_pydatetime(),
-                )
-            )
-        return candles
-
-    def _load_from_json(self, symbol: str, start: datetime, end: datetime) -> list[CandleEvent]:
-        raw = json.loads(self._path.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and "records" in raw:
-            records = raw["records"]
-        elif isinstance(raw, list):
-            records = raw
-        else:
-            msg = "JSON dataset must be a list of records or contain a 'records' field"
-            raise ValueError(msg)  # pragma: no cover - defensive guard
-
-        candles: list[CandleEvent] = []
-        for record in records:
-            if record.get("symbol") != symbol:
-                continue
-            start_ts = self._coerce_datetime(record.get("start"))
-            end_ts = self._coerce_datetime(record.get("end"))
-            if end_ts < start or start_ts > end:
-                continue
-            candles.append(
-                CandleEvent(
-                    symbol=symbol,
-                    open=float(record["open"]),
-                    high=float(record["high"]),
-                    low=float(record["low"]),
-                    close=float(record["close"]),
-                    volume=float(record["volume"]),
-                    start=start_ts,
-                    end=end_ts,
-                )
-            )
-        candles.sort(key=lambda candle: candle.start)
-        return candles
-
-    @staticmethod
-    def _coerce_datetime(value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value.astimezone(UTC)
-        if isinstance(value, str):
-            parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=UTC)
-            return parsed.astimezone(UTC)
-        msg = f"Unsupported datetime value: {value!r}"
-        raise TypeError(msg)  # pragma: no cover - defensive guard
 
 
 @dataclass(slots=True)

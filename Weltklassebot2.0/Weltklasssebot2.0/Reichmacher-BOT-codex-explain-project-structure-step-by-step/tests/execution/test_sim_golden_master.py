@@ -7,8 +7,8 @@ from datetime import UTC, datetime, timedelta
 
 from core.events import FillEvent, OrderEvent, OrderSide, OrderType
 from execution.orderbook import OrderBook
-from execution.simulator import ExecConfig, OmsSimulator, Rejection
-from execution.slippage import ImpactLinear
+from execution.oms_simulator import ExecConfig, OmsSimulator, Rejection
+from execution.slippage import LinearSlippage
 from tests.execution.utils import stable_hash, vwap
 
 BASE_TS = datetime(2024, 1, 1, tzinfo=UTC)
@@ -93,14 +93,13 @@ def test_simulator_golden_master() -> None:
         book.add("ask", price, size)
 
     cfg = ExecConfig(
-        slippage=ImpactLinear(k=1e-4),
+        slippage=LinearSlippage(bps_per_notional=1e-4),
         taker_fee=0.0004,
         maker_fee=0.0002,
         latency_ms=30,
         jitter_ms=5,
-        seed=1337,
     )
-    sim = OmsSimulator(book, cfg)
+    sim = OmsSimulator(book, cfg, seed=1337)
 
     rows: list[tuple[str, str, str, float, float, float, str, str]] = []
     buy_prices: list[tuple[float, float]] = []
