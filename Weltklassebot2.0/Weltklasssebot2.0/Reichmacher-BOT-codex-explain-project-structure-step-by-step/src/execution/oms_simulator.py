@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Literal, cast
 
 try:  # pragma: no cover - optional dependency guard
-    from numpy.random import Generator, default_rng
+    from numpy.random import Generator, PCG64
 except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
     import random as _random
 
-    class _StubGenerator:
+    class Generator:  # type: ignore[override]
         """Minimal RNG stub implementing the required numpy Generator API."""
 
         __slots__ = ("_rng",)
@@ -21,6 +21,9 @@ except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
 
         def random(self) -> float:
             return self._rng.random()
+
+        def uniform(self, low: float, high: float) -> float:
+            return self._rng.uniform(low, high)
 
         def integers(
             self,
@@ -38,10 +41,16 @@ except ModuleNotFoundError:  # pragma: no cover - deterministic fallback
                 return low
             return self._rng.randrange(low, high)
 
-    Generator = _StubGenerator
+    class PCG64:  # type: ignore[override]
+        def __init__(self, seed: int | None = None) -> None:
+            self._seed = seed
 
-    def default_rng(seed: int | None = None) -> _StubGenerator:
-        return _StubGenerator(seed)
+    def _build_generator(seed: int | None = None) -> Generator:
+        return Generator(seed)
+else:  # pragma: no cover - numpy path
+
+    def _build_generator(seed: int | None = None) -> Generator:
+        return Generator(PCG64(seed))
 
 from core.events import (
     FillEvent,
@@ -50,8 +59,10 @@ from core.events import (
     OrderSide,
     OrderType,
 )
+from execution.fees import FeeModel, FlatFee
 from execution.orderbook import OrderBook
 from execution.slippage import SlippageModel
+from execution.normalizer import round_price, round_qty
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,19 +77,34 @@ class ExecConfig:
     """Configuration controlling the OMS simulator."""
 
     slippage: SlippageModel
-    taker_fee: float
-    maker_fee: float
-    latency_ms: int
-    jitter_ms: int
-    seed: int = 0
+    taker_fee: float = 0.0
+    maker_fee: float = 0.0
+    latency_ms: int = 0
+    jitter_ms: int = 0
+    fee_model: FeeModel | None = None
+    venue: str = "default"
+    symbol: str | None = None
+    tick_size: float = 1e-8
+    min_qty: float = 1e-6
 
     def __post_init__(self) -> None:
-        if self.taker_fee < 0 or self.maker_fee < 0:
-            msg = "fees must be non-negative"
-            raise ValueError(msg)
         if self.latency_ms < 0 or self.jitter_ms < 0:
             msg = "latency and jitter must be non-negative"
             raise ValueError(msg)
+        if self.taker_fee < 0 or self.maker_fee < 0:
+            msg = "fees must be non-negative"
+            raise ValueError(msg)
+        if self.tick_size <= 0:
+            msg = "tick_size must be positive"
+            raise ValueError(msg)
+        if self.min_qty <= 0:
+            msg = "min_qty must be positive"
+            raise ValueError(msg)
+        if self.fee_model is None:
+            maker_bps = abs(self.maker_fee) * 10_000.0
+            taker_bps = abs(self.taker_fee) * 10_000.0
+            self.fee_model = FlatFee(bps=maker_bps, taker_bps_override=taker_bps)
+        self.fee_model = cast(FeeModel, self.fee_model)
 
 
 @dataclass(slots=True)
@@ -93,16 +119,45 @@ class _RestingOrder:
 class OmsSimulator:
     """Simulate an order management system against a level-2 book."""
 
-    def __init__(self, book: OrderBook, cfg: ExecConfig, rng: Generator | None = None) -> None:
+    def __init__(
+        self,
+        book: OrderBook,
+        cfg: ExecConfig,
+        *,
+        seed: int | None = None,
+        rng: Generator | None = None,
+    ) -> None:
         self._book = book
         self._cfg = cfg
-        self._rng = rng or default_rng(cfg.seed)
+        self._fee_model = cfg.fee_model
+        self._rng = rng or _build_generator(seed)
+        self._tick_size = cfg.tick_size
+        self._min_qty = cfg.min_qty
+        if hasattr(self._cfg.slippage, "bind_rng"):
+            slippage_seed = (seed if seed is not None else 0) + 1
+            self._cfg.slippage.bind_rng(_build_generator(slippage_seed))
         self._positions: dict[str, float] = {}
         self._resting: list[_RestingOrder] = []
 
+    @property
+    def tick_size(self) -> float:
+        return self._tick_size
+
+    @property
+    def min_qty(self) -> float:
+        return self._min_qty
+
+    def normalise_order(self, order: OrderEvent) -> OrderEvent:
+        price = round_price(order.price, self._tick_size)
+        stop = round_price(order.stop, self._tick_size)
+        qty = round_qty(order.qty, self._min_qty)
+        return replace(order, price=price, stop=stop, qty=qty)
+
     def send(self, order: OrderEvent, now: datetime) -> list[FillEvent] | Rejection:
-        if order.qty <= 0:
-            return Rejection("invalid_quantity")
+        try:
+            order = self.normalise_order(order)
+        except ValueError as exc:
+            return Rejection(str(exc))
         if order.reduce_only and not self._can_reduce(order):
             return Rejection("reduce_only_violation")
         effective_type = order.type
@@ -143,7 +198,10 @@ class OmsSimulator:
             if removed <= 0.0:
                 continue
             fill_ts = self._fill_timestamp(now)
-            fee = resting.price * removed * self._cfg.maker_fee
+            notional = resting.price * removed
+            fee = 0.0
+            if self._fee_model is not None:
+                fee = self._fee_model.apply(notional, is_maker=True)
             fill = FillEvent(
                 order_id=resting.order.id,
                 ts=fill_ts,
@@ -173,7 +231,10 @@ class OmsSimulator:
             notional,
             mid,
         )
-        fee = price * filled * self._cfg.taker_fee
+        notional = price * filled
+        fee = 0.0
+        if self._fee_model is not None:
+            fee = self._fee_model.apply(notional, is_maker=False)
         fill_ts = self._fill_timestamp(now)
         fill = FillEvent(
             order_id=order.id,
@@ -212,7 +273,10 @@ class OmsSimulator:
                     notional,
                     mid if mid > 0 else limit_price,
                 )
-                fee = price * taker_filled * self._cfg.taker_fee
+                notional = price * taker_filled
+                fee = 0.0
+                if self._fee_model is not None:
+                    fee = self._fee_model.apply(notional, is_maker=False)
                 fill_ts = self._fill_timestamp(now)
                 fills.append(
                     FillEvent(

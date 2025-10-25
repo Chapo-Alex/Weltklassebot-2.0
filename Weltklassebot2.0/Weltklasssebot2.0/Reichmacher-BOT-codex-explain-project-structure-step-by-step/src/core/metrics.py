@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from typing import cast
 
+logger = logging.getLogger(__name__)
+
 try:  # pragma: no cover - optional dependency
     from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
+    _PROM_CLIENT_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - offline environments
     from core._prometheus_stub import (
         CollectorRegistry,
@@ -15,6 +20,9 @@ except ModuleNotFoundError:  # pragma: no cover - offline environments
         Histogram,
         start_http_server,
     )
+
+    _PROM_CLIENT_AVAILABLE = False
+    logger.info("prometheus_client not installed; metrics exporter disabled")
 
 @dataclass(slots=True)
 class _MetricHandles:
@@ -160,6 +168,38 @@ def get_registry() -> CollectorRegistry | None:
     return _REGISTRY
 
 
+def maybe_start_server() -> None:
+    """Start the Prometheus exporter if the client library is available."""
+
+    port_raw = os.getenv("WELTKLASSE_METRICS_PORT", "9000")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        logger.warning(
+            "Invalid metrics port provided; defaulting to 9000", extra={"port": port_raw}
+        )
+        port = 9000
+
+    if not _PROM_CLIENT_AVAILABLE:
+        logger.info(
+            "Skipping metrics exporter startup because prometheus_client is unavailable",
+            extra={"port": port},
+        )
+        return
+
+    registry = get_registry()
+    if registry is None:
+        configure_metrics()
+        registry = get_registry()
+
+    if registry is None:
+        logger.warning("Metrics registry could not be configured; exporter not started")
+        return
+
+    start_http_server(port, registry=registry)
+    logger.info("Prometheus metrics exporter started", extra={"port": port})
+
+
 def set_registry(registry: CollectorRegistry | None) -> None:
     """Bind metrics to ``registry`` or reset to the default registry."""
 
@@ -187,6 +227,7 @@ __all__ = [
     "CFG_MAX_DRAWDOWN",
     "configure_metrics",
     "get_registry",
+    "maybe_start_server",
     "set_registry",
     "start_http_server",
 ]

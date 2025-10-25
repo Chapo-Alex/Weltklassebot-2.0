@@ -197,7 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--from", dest="start", default="2024-01-01T00:00:00Z")
     parser.add_argument("--to", dest="end", default="2024-01-01T01:00:00Z")
     parser.add_argument("--strategy", default="breakout")
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--candles", type=int, default=60)
     parser.add_argument("--params", default="{}", help="JSON encoded strategy overrides")
     args = parser.parse_args(list(argv) if argv is not None else None)

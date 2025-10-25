@@ -2,33 +2,42 @@
 
 from __future__ import annotations
 
+import random as _random
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-from random import Random
 from time import perf_counter
 from typing import Any, Literal, Protocol, TypeVar, cast
 
 from backtest.primitives import BacktestResult, EquityPoint, MakerTakerFeeModel, ParquetDataLoader
+from core.config import BacktestConfig
 from core.events import CandleEvent, FillEvent, LiquidityFlag, OrderEvent, OrderSide
 from core.metrics import LAT
+from core.io.replay import ReplayLogs
 from execution.orderbook import OrderBook
-from execution.simulator import ExecConfig, OmsSimulator, Rejection
-from execution.slippage import ImpactLinear, SlippageModel
+from execution.fees import FlatFee
+from execution.oms_simulator import ExecConfig, OmsSimulator, Rejection
+from execution.slippage import LinearSlippage, SlippageModel
+from registry.venues import resolve_models
 from portfolio.accounting import FeeModel, Portfolio
-from portfolio.risk import RiskContext, RiskManagerV2, RiskParameters, State
+from portfolio.risk import RiskContext, RiskManagerV2, State
 from portfolio.risk_state_store import JsonlStateStore
 from strategy.breakout_bias import BreakoutBiasStrategy, StrategyConfig
 from tca.metrics import adverse_selection, implementation_shortfall, vwap
 
-_np_default_rng: Callable[[int], Any] | None
-try:  # pragma: no cover - optional dependency used for determinism
-    from numpy.random import default_rng as _imported_default_rng
-except ModuleNotFoundError:  # pragma: no cover - fallback to simulator defaults
-    _np_default_rng = None
-else:  # pragma: no cover - import succeeds
-    _np_default_rng = _imported_default_rng
+try:  # pragma: no cover - numpy optional dependency
+    from numpy.random import Generator as _NPGenerator, PCG64 as _NPPCG64
+except ModuleNotFoundError:  # pragma: no cover - numpy not installed
+    _NPGenerator = None
+    _NPPCG64 = None
+
+
+def _build_uniform_rng(seed: int | None) -> Any:
+    """Return an RNG supporting ``uniform`` for deterministic jitter."""
+
+    if _NPGenerator is not None and _NPPCG64 is not None:
+        return _NPGenerator(_NPPCG64(seed))
+    return _random.Random(seed)
 
 T = TypeVar("T")
 _TCA_EPS = 1e-9
@@ -60,49 +69,6 @@ def _is_slippage(candidate: Any) -> bool:
     return hasattr(candidate, "taker_price") and hasattr(candidate, "maker_fill_prob")
 
 
-@dataclass(slots=True)
-class BacktestConfig:
-    """Configuration for orchestrating a single backtest run."""
-
-    data_path: Path
-    symbol: str
-    start: datetime
-    end: datetime
-    seed: int = 1337
-    maker_fee: float = 0.0
-    taker_fee: float = 0.0
-    latency_ms: float = 0.0
-    impact_coefficient: float = 0.0
-    initial_cash: float = 1_000_000.0
-    session_name: str = "backtest"
-    execution: Literal["sim", "paper"] = "sim"
-    exec_params: dict[str, Any] = field(default_factory=dict)
-    risk_store_dir: Path | None = None
-    risk: RiskParameters = field(
-        default_factory=lambda: RiskParameters(
-            max_drawdown=1e12,
-            max_notional=1e12,
-            max_trades_per_day=1_000_000,
-            cooldown_minutes=0.0,
-        )
-    )
-    strategy_config: StrategyConfig | None = None
-
-    def __post_init__(self) -> None:
-        self.data_path = self.data_path.expanduser().resolve()
-        self.start = self._ensure_utc(self.start)
-        self.end = self._ensure_utc(self.end)
-        if self.end < self.start:
-            msg = "End timestamp must not be before start timestamp"
-            raise ValueError(msg)
-        if self.risk_store_dir is not None:
-            self.risk_store_dir = Path(self.risk_store_dir).expanduser().resolve()
-
-    @staticmethod
-    def _ensure_utc(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value.astimezone(UTC)
 
 class BacktestEngine:
     """Replay candles through a strategy while applying risk controls."""
@@ -116,8 +82,19 @@ class BacktestEngine:
         portfolio: Portfolio | None = None,
         risk_manager: RiskManagerV2 | None = None,
         execution_client: ExecutionClient | None = None,
+        mode: Literal["backtest", "replay"] = "backtest",
+        replay_logs: ReplayLogs | None = None,
     ) -> None:
         self._config = config
+        if mode not in {"backtest", "replay"}:
+            msg = f"Unsupported engine mode: {mode!r}"
+            raise ValueError(msg)
+        if mode == "replay" and replay_logs is None:
+            msg = "Replay mode requires replay_logs"
+            raise ValueError(msg)
+        self._mode = mode
+        self._replay_logs = replay_logs
+        self._rng_seed = int(config.seed)
         self._data_loader = data_loader or ParquetDataLoader(config.data_path)
         strategy_cfg = config.strategy_config or StrategyConfig()
         self._strategy = strategy or BreakoutBiasStrategy(strategy_cfg)
@@ -129,7 +106,12 @@ class BacktestEngine:
         self._risk_store: JsonlStateStore | None = None
         self._persisted_risk_state: str | None = None
         if config.risk_store_dir is not None:
-            store = JsonlStateStore(config.risk_store_dir)
+            store = JsonlStateStore(
+                config.risk_store_dir,
+                rotate_lines=config.risk_store_rotate_lines,
+                rotate_mb=config.risk_store_rotate_mb,
+                fsync=config.risk_store_fsync,
+            )
             record = store.load_state()
             raw_state = str(record.get("state", "RUNNING"))
             state_name = raw_state if raw_state in State.__members__ else "RUNNING"
@@ -141,7 +123,12 @@ class BacktestEngine:
         self._marks: dict[str, float] = {}
         self._order_book = OrderBook()
         self._fills: list[FillEvent] = []
-        self._execution = execution_client or self._build_execution()
+        self._orders: list[OrderEvent] = []
+        self._events: list[dict[str, Any]] = []
+        if self._mode == "replay":
+            self._execution = execution_client
+        else:
+            self._execution = execution_client or self._build_execution()
         self._max_equity = config.initial_cash
         self._last_equity = config.initial_cash
         self._drawdown = 0.0
@@ -149,8 +136,26 @@ class BacktestEngine:
         self._current_session_date: date | None = None
         self._open_trades: dict[str, list[_OpenTrade]] = {}
         self._tca_results: list[dict[str, float]] = []
+        self._last_candle_mid: float | None = None
 
     def run(self) -> BacktestResult:
+        if self._mode == "replay":
+            return self._run_replay()
+        return self._run_backtest()
+
+    def _run_backtest(self) -> BacktestResult:
+        self._orders = []
+        self._events = []
+        self._tca_results = []
+        self._marks = {}
+        self._fills = []
+        self._order_book = OrderBook()
+        self._open_trades = {}
+        self._max_equity = self._config.initial_cash
+        self._last_equity = self._config.initial_cash
+        self._drawdown = 0.0
+        self._trades_today = 0
+        self._current_session_date = None
         candles = self._time_stage(
             "data_load",
             self._data_loader.load,
@@ -158,7 +163,6 @@ class BacktestEngine:
             self._config.start,
             self._config.end,
         )
-        self._fills = []
         equity_curve: list[EquityPoint] = []
         for candle in candles:
             self._update_order_book(candle)
@@ -171,7 +175,8 @@ class BacktestEngine:
 
             orders = self._time_stage("strategy", self._strategy.generate_orders, [candle])
             for order in orders:
-                ctx = self._build_context(order.ts)
+                self._record_order(order)
+                ctx = self._build_context(order.ts, symbol=order.symbol)
                 decision = self._time_stage("risk_allow", self._risk.allow, order, ctx)
                 self._record_risk_state_change("allow")
                 if decision is not True:
@@ -200,6 +205,79 @@ class BacktestEngine:
             candles_processed=len(candles),
             config=self._config,
             tca=list(self._tca_results),
+            orders=list(self._orders),
+            events=list(self._events),
+        )
+
+    def _run_replay(self) -> BacktestResult:
+        if self._replay_logs is None:
+            msg = "Replay mode requires replay_logs"
+            raise ValueError(msg)
+
+        self._marks = {}
+        self._fills = []
+        self._orders = list(self._replay_logs.orders)
+        self._events = list(self._replay_logs.events)
+        self._tca_results = []
+        self._order_book = OrderBook()
+        self._open_trades = {}
+        self._max_equity = self._config.initial_cash
+        self._last_equity = self._config.initial_cash
+        self._drawdown = 0.0
+        self._trades_today = 0
+        self._current_session_date = None
+
+        candles = self._time_stage(
+            "data_load",
+            self._data_loader.load,
+            self._config.symbol,
+            self._config.start,
+            self._config.end,
+        )
+
+        replay_fills = sorted(self._replay_logs.fills, key=lambda fill: fill.ts)
+        fill_idx = 0
+        total_fills = len(replay_fills)
+        equity_curve: list[EquityPoint] = []
+
+        for candle in candles:
+            self._update_order_book(candle)
+            self._marks[candle.symbol] = candle.close
+            self._update_equity()
+            self._max_equity = max(self._max_equity, self._last_equity)
+            self._drawdown = max(0.0, self._max_equity - self._last_equity)
+            self._maybe_reset_session(candle.end)
+            self._update_risk_context(timestamp=candle.end)
+
+            while fill_idx < total_fills and replay_fills[fill_idx].ts <= candle.end:
+                self._handle_fill(replay_fills[fill_idx])
+                fill_idx += 1
+
+            self._update_equity()
+            self._max_equity = max(self._max_equity, self._last_equity)
+            self._drawdown = max(0.0, self._max_equity - self._last_equity)
+            equity_curve.append(
+                EquityPoint(
+                    ts=candle.end,
+                    equity=self._last_equity,
+                    cash=self._portfolio.cash,
+                    notional=self._current_notional(),
+                    drawdown=self._drawdown,
+                )
+            )
+
+        if fill_idx != total_fills:
+            msg = "Not all replay fills were consumed"
+            raise ValueError(msg)
+
+        return BacktestResult(
+            fills=list(self._fills),
+            equity_curve=equity_curve,
+            candles_processed=len(candles),
+            config=self._config,
+            tca=list(self._tca_results),
+            orders=list(self._orders),
+            events=list(self._events),
         )
 
     def _maybe_reset_session(self, timestamp: datetime) -> None:
@@ -209,11 +287,19 @@ class BacktestEngine:
             self._trades_today = 0
 
     def _update_risk_context(self, timestamp: datetime) -> None:
-        ctx = self._build_context(timestamp)
+        ctx = self._build_context(timestamp, symbol=self._config.symbol)
         self._time_stage("risk_transition", self._risk.transition, ctx)
         self._record_risk_state_change("transition")
 
-    def _build_context(self, timestamp: datetime) -> RiskContext:
+    def _build_context(self, timestamp: datetime, symbol: str | None = None) -> RiskContext:
+        orderbook_mid = self._order_book.mid()
+        if orderbook_mid is None:
+            orderbook_mid = self._last_candle_mid
+        last_close = None
+        if symbol is not None:
+            last_close = self._marks.get(symbol)
+        elif self._marks:
+            last_close = self._marks.get(self._config.symbol)
         return RiskContext(
             equity=self._last_equity,
             drawdown=self._drawdown,
@@ -221,6 +307,8 @@ class BacktestEngine:
             trades_today=self._trades_today,
             now=timestamp,
             session=self._config.session_name,
+            orderbook_mid=orderbook_mid,
+            last_close=last_close,
         )
 
     def _current_notional(self) -> float:
@@ -237,12 +325,13 @@ class BacktestEngine:
         self._time_stage("portfolio_apply", self._portfolio.apply_fill, fill)
         after_qty = self._position_qty(fill.symbol)
         self._fills.append(fill)
+        self._log_fill(fill)
         self._trades_today += 1
         self._update_tca(fill, before_qty, after_qty)
         self._update_equity()
         self._max_equity = max(self._max_equity, self._last_equity)
         self._drawdown = max(0.0, self._max_equity - self._last_equity)
-        transition_ctx = self._build_context(fill.ts)
+        transition_ctx = self._build_context(fill.ts, symbol=fill.symbol)
         self._time_stage("risk_transition", self._risk.transition, transition_ctx)
         self._record_risk_state_change("fill")
 
@@ -393,21 +482,37 @@ class BacktestEngine:
             event["cooldown_until"] = cooldown_until
         self._risk_store.append_audit(event)
         self._persisted_risk_state = state_name
+        self._log_event(
+            {
+                "ts": datetime.fromtimestamp(timestamp, tz=UTC).isoformat(),
+                "type": "risk_state",
+                "state": state_name,
+                "source": source,
+                "reason": reason,
+            }
+        )
 
     def _build_execution(self) -> ExecutionClient:
         if self._config.execution == "paper":
-            return _PaperExecution(self._marks, self._config)
+            return _PaperExecution(self._marks, self._config, seed=self._rng_seed)
         if self._config.execution != "sim":
             msg = f"Unsupported execution mode: {self._config.execution}"
             raise ValueError(msg)
 
         exec_params = dict(self._config.exec_params)
+        profile = resolve_models(self._config.venue, self._config.symbol)
         slippage_candidate = exec_params.get("slippage")
         if _is_slippage(slippage_candidate):
             exec_params["slippage"] = cast(SlippageModel, slippage_candidate)
         else:
             coefficient = float(self._config.impact_coefficient)
-            exec_params["slippage"] = ImpactLinear(k=coefficient)
+            if coefficient > 0:
+                exec_params["slippage"] = LinearSlippage(
+                    bps_per_notional=coefficient,
+                    seed=self._rng_seed,
+                )
+            else:
+                exec_params["slippage"] = profile.slippage_model
         taker_default = self._config.taker_fee if self._config.taker_fee > 0 else 0.0004
         maker_default = self._config.maker_fee if self._config.maker_fee > 0 else 0.0002
         latency_default = (
@@ -415,18 +520,34 @@ class BacktestEngine:
             if self._config.latency_ms > 0
             else 30
         )
-        exec_params.setdefault("taker_fee", taker_default)
-        exec_params.setdefault("maker_fee", maker_default)
+        fee_model = exec_params.get("fee_model")
+        if fee_model is None:
+            if self._config.maker_fee > 0 or self._config.taker_fee > 0:
+                maker_bps = abs(self._config.maker_fee) * 10_000.0
+                taker_bps = abs(self._config.taker_fee) * 10_000.0
+                exec_params["fee_model"] = FlatFee(
+                    bps=maker_bps,
+                    taker_bps_override=taker_bps,
+                )
+                exec_params.setdefault("taker_fee", taker_default)
+                exec_params.setdefault("maker_fee", maker_default)
+            else:
+                exec_params["fee_model"] = profile.fee_model
         exec_params.setdefault("latency_ms", latency_default)
         exec_params.setdefault("jitter_ms", 5)
-        exec_params.setdefault("seed", self._config.seed)
-        exec_params["taker_fee"] = float(exec_params["taker_fee"])
-        exec_params["maker_fee"] = float(exec_params["maker_fee"])
+        exec_seed = int(exec_params.pop("seed", self._rng_seed))
+        if "taker_fee" in exec_params:
+            exec_params["taker_fee"] = float(exec_params["taker_fee"])
+        if "maker_fee" in exec_params:
+            exec_params["maker_fee"] = float(exec_params["maker_fee"])
         exec_params["latency_ms"] = int(exec_params["latency_ms"])
         exec_params["jitter_ms"] = int(exec_params["jitter_ms"])
+        exec_params.setdefault("venue", self._config.venue)
+        exec_params.setdefault("symbol", self._config.symbol)
+        exec_params.setdefault("tick_size", float(profile.tick_size))
+        exec_params.setdefault("min_qty", float(profile.min_qty))
         cfg = ExecConfig(**exec_params)
-        rng = _np_default_rng(self._config.seed) if _np_default_rng is not None else None
-        simulator = OmsSimulator(self._order_book, cfg, rng=rng)
+        simulator = OmsSimulator(self._order_book, cfg, seed=exec_seed)
         return _SimulatorClient(simulator, self._handle_fill)
 
     def _update_order_book(self, candle: CandleEvent) -> None:
@@ -434,6 +555,7 @@ class BacktestEngine:
         size = max(candle.volume * 0.05, 1.0)
         bid_price = max(candle.close - spread, 0.01)
         ask_price = candle.close + spread
+        self._last_candle_mid = (candle.high + candle.low) / 2.0
         self._order_book.ts = candle.end
         self._order_book.add("bid", bid_price, size)
         self._order_book.add("ask", ask_price, size)
@@ -457,6 +579,45 @@ class BacktestEngine:
         finally:
             duration = perf_counter() - start
             LAT.labels(stage=stage).observe(duration)
+
+    def _record_order(self, order: OrderEvent) -> None:
+        if self._mode == "replay":
+            return
+        self._orders.append(order)
+        self._log_event(
+            {
+                "ts": order.ts.astimezone(UTC).isoformat(),
+                "type": "order_submitted",
+                "order_id": order.id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "qty": order.qty,
+                "price": order.price,
+                "tif": order.tif,
+            }
+        )
+
+    def _log_fill(self, fill: FillEvent) -> None:
+        if self._mode == "replay":
+            return
+        self._log_event(
+            {
+                "ts": fill.ts.astimezone(UTC).isoformat(),
+                "type": "fill",
+                "order_id": fill.order_id,
+                "symbol": fill.symbol,
+                "side": fill.side.value,
+                "qty": fill.qty,
+                "price": fill.price,
+                "fee": fill.fee,
+                "liquidity": fill.liquidity_flag.value,
+            }
+        )
+
+    def _log_event(self, payload: dict[str, Any]) -> None:
+        if self._mode == "replay":
+            return
+        self._events.append(payload)
 
 
 class _SimulatorClient:
@@ -489,10 +650,10 @@ class _PaperExecution:
 
     __slots__ = ("_marks", "_config", "_rng")
 
-    def __init__(self, marks: dict[str, float], config: BacktestConfig) -> None:
+    def __init__(self, marks: dict[str, float], config: BacktestConfig, *, seed: int) -> None:
         self._marks = marks
         self._config = config
-        self._rng = Random(config.seed)
+        self._rng = _build_uniform_rng(seed)
 
     def send(self, order: OrderEvent, now: datetime) -> list[FillEvent]:
         price = order.price if order.price is not None else self._marks.get(order.symbol, 0.0)

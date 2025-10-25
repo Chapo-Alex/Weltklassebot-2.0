@@ -10,6 +10,7 @@ spec:
     - name: weltklasse.trading
       rules:
         - alert: HighStageLatency
+          # stage_latency_seconds is recorded in seconds.
           expr: |
             histogram_quantile(0.95, sum(rate(stage_latency_seconds_bucket[5m])) by (le, stage)) > 0.25
           for: 5m
@@ -21,7 +22,7 @@ spec:
               Execution stage {{ $labels.stage }} p95 latency exceeded 250ms.
         - alert: RiskCooldownTooLong
           expr: |
-            max_over_time(risk_state[30m]) == 1
+            max_over_time(risk_state{state="COOL"}[30m]) == 1
           for: 30m
           labels:
             severity: warn

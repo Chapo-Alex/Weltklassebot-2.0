@@ -7,7 +7,7 @@ from pathlib import Path
 
 from core.engine import BacktestConfig, BacktestEngine
 from core.events import CandleEvent, OrderEvent, OrderSide, OrderType
-from execution.slippage import ImpactLinear
+from execution.slippage import LinearSlippage
 
 
 @dataclass(slots=True)
@@ -76,7 +76,7 @@ def test_engine_emits_tca_metrics(tiny_candles) -> None:
         seed=1337,
         execution="sim",
         exec_params={
-            "slippage": ImpactLinear(k=0.0),
+            "slippage": LinearSlippage(bps_per_notional=0.0),
             "taker_fee": 0.0003,
             "maker_fee": 0.0001,
             "latency_ms": 0,

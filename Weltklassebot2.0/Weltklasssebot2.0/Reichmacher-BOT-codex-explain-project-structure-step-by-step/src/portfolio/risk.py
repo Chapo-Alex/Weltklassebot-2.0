@@ -72,6 +72,8 @@ class RiskContext:
     trades_today: int
     now: datetime
     session: str
+    orderbook_mid: float | None = None
+    last_close: float | None = None
 
 
 @dataclass(slots=True)
@@ -126,9 +128,8 @@ class RiskManagerV2:
         """Determine whether an order is permitted under the current limits."""
 
         state = self.transition(ctx)
-        projected = ctx.notional
-        if order.price is not None:
-            projected += abs(order.qty) * order.price
+        price = self._resolve_price(order, ctx)
+        projected = ctx.notional + abs(order.qty) * price
         self._last_projected = projected
         self._metrics.projected_exposure.set(projected)
 
@@ -145,6 +146,11 @@ class RiskManagerV2:
         ):
             return self._deny("trade_limit")
         return True
+
+    def validate(self, order: OrderEvent, ctx: RiskContext) -> None:
+        """Validate inputs required for projecting risk exposure."""
+
+        self._resolve_price(order, ctx)
 
     def transition(self, ctx: RiskContext) -> State:
         """Evaluate the state machine against the provided context."""
@@ -208,6 +214,20 @@ class RiskManagerV2:
     def _deny(self, reason: str) -> str:
         self._metrics.denials.labels(reason=reason).inc()
         return reason
+
+    def _resolve_price(self, order: OrderEvent, ctx: RiskContext) -> float:
+        """Resolve an execution price for projection purposes."""
+
+        price = order.price
+        if price is None:
+            price = ctx.orderbook_mid if ctx.orderbook_mid is not None else ctx.last_close
+        if price is None:
+            msg = (
+                "Unable to project exposure for order: missing price data "
+                "(order.price, orderbook_mid, last_close are None)"
+            )
+            raise ValueError(msg)
+        return float(price)
 
     def _log_transition(
         self, new_state: State, reason: str, ctx: RiskContext | None

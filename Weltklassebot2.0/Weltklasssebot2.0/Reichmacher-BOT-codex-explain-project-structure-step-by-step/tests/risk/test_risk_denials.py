@@ -32,6 +32,8 @@ def _make_ctx(
     notional: float = 0.0,
     trades_today: int = 0,
     session: str = "regular",
+    orderbook_mid: float | None = 100.0,
+    last_close: float | None = 100.0,
 ) -> RiskContext:
     return RiskContext(
         equity=equity,
@@ -40,6 +42,8 @@ def _make_ctx(
         trades_today=trades_today,
         now=now,
         session=session,
+        orderbook_mid=orderbook_mid,
+        last_close=last_close,
     )
 
 
